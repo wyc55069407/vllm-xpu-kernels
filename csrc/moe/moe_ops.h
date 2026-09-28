@@ -110,3 +110,11 @@ torch::Tensor reorder_mxfp_scales(
     const torch::Tensor& A_scales,
     const torch::Tensor& rows_per_expert,
     const int64_t total_padded_rows);
+
+void router_gemv_topk_softmax(
+    const torch::Tensor& x,
+    const torch::Tensor& router_weight,
+    torch::Tensor& logits,
+    torch::Tensor& topk_weights,
+    torch::Tensor& topk_ids,
+    bool renormalize);

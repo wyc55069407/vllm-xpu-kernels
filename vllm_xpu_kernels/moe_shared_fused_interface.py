@@ -14,6 +14,10 @@ import torch
 
 # Largest num_tokens * top_k handled by the kernel's routing map.
 _MAX_ROUTED_ROWS = 512
+# Limits of torch.ops._moe_C.router_gemv_topk_softmax.
+_ROUTER_MAX_TOKENS = 8
+_ROUTER_MAX_EXPERTS = 512
+_ROUTER_MAX_TOP_K = 16
 
 
 def is_available() -> bool:
@@ -23,6 +27,32 @@ def is_available() -> bool:
     except ImportError:
         return False
     return hasattr(torch.ops._xpu_C, "moe_shared_fused_decode_interface")
+
+
+def router_is_available() -> bool:
+    """Whether this build provides the fused decode router op."""
+    try:
+        import vllm_xpu_kernels._moe_C  # noqa: F401
+    except ImportError:
+        return False
+    return hasattr(torch.ops._moe_C, "router_gemv_topk_softmax")
+
+
+def router_supports(
+    router_weight_dtype: torch.dtype,
+    num_experts: int,
+    top_k: int,
+    hidden_size: int,
+) -> bool:
+    """Whether the fused router (fp16 router GEMV + softmax top-k) supports
+    this configuration (for up to 8 tokens per call)."""
+    return (
+        router_is_available()
+        and router_weight_dtype == torch.float16
+        and num_experts <= _ROUTER_MAX_EXPERTS
+        and 1 <= top_k <= min(_ROUTER_MAX_TOP_K, num_experts)
+        and hidden_size % 128 == 0
+    )
 
 
 def supports(
@@ -87,6 +117,10 @@ class XpuMoESharedFusedDecode:
       shared_gate [H] or [1, H] fp16
 
     tile_m selects the GEMM M-tile (8 or 16); 0 lets the op pick by M.
+
+    With router_weight ([E, H] fp16) set, forward_routed() also computes the
+    softmax top-k routing (renormalized if renormalize) in the op, for up to
+    8 tokens per call.
     """
 
     def __init__(
@@ -102,6 +136,8 @@ class XpuMoESharedFusedDecode:
         shared_gate: torch.Tensor,
         top_k: int,
         tile_m: int = 0,
+        router_weight: torch.Tensor | None = None,
+        renormalize: bool = True,
     ):
         assert tile_m in (0, 8, 16), "tile_m must be 0 (auto), 8 or 16"
         self.w13 = w13.contiguous()
@@ -117,6 +153,11 @@ class XpuMoESharedFusedDecode:
         self.num_experts = w13.shape[0]
         self.tile_m = tile_m
         self._ws: dict[int, torch.Tensor] = {}
+        self.router_weight = (
+            router_weight.contiguous() if router_weight is not None else None
+        )
+        self.renormalize = renormalize
+        self._routing: dict[int, tuple[torch.Tensor, ...]] = {}
 
     def workspace(self, num_tokens: int, device: torch.device) -> torch.Tensor:
         ws = self._ws.get(num_tokens)
@@ -160,3 +201,40 @@ class XpuMoESharedFusedDecode:
             self.tile_m,
         )
         return output
+
+    def route(
+        self, hidden_states: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Softmax top-k routing of hidden_states with router_weight.
+
+        Returns (topk_weights fp32, topk_ids int32), [M, top_k] each; the
+        buffers are reused across calls with the same M.
+        """
+        assert self.router_weight is not None, "no router_weight given"
+        m = hidden_states.shape[0]
+        bufs = self._routing.get(m)
+        if bufs is None:
+            dev = hidden_states.device
+            bufs = (
+                torch.empty(m, self.num_experts, dtype=torch.float32, device=dev),
+                torch.empty(m, self.top_k, dtype=torch.float32, device=dev),
+                torch.empty(m, self.top_k, dtype=torch.int32, device=dev),
+            )
+            self._routing[m] = bufs
+        logits, topk_weights, topk_ids = bufs
+        torch.ops._moe_C.router_gemv_topk_softmax(
+            hidden_states,
+            self.router_weight,
+            logits,
+            topk_weights,
+            topk_ids,
+            self.renormalize,
+        )
+        return topk_weights, topk_ids
+
+    def forward_routed(
+        self, output: torch.Tensor, hidden_states: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """route() + forward(); returns (output, topk_ids)."""
+        topk_weights, topk_ids = self.route(hidden_states)
+        return self.forward(output, hidden_states, topk_weights, topk_ids), topk_ids
