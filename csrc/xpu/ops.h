@@ -437,3 +437,14 @@ void qkv_split_norm_rope(
     double weight_offset,
     std::vector<int64_t> mrope_section,
     bool mrope_interleaved);
+
+// One-shot P2P all-reduce (TP=2) over Level Zero IPC; see
+// csrc/xpu/custom_ar/custom_ar.cpp and vllm_xpu_kernels/custom_all_reduce.py.
+int64_t custom_ar_create(int64_t max_bytes);
+std::vector<int64_t> custom_ar_export(int64_t h);
+int64_t custom_ar_open(
+    int64_t h, int64_t rank, std::vector<int64_t> peer, int64_t mode_mask);
+void custom_ar_all_reduce_(at::Tensor& x, int64_t h);
+int64_t custom_ar_error(int64_t h);
+void custom_ar_destroy(int64_t h);
+int64_t custom_ar_max_bytes_limit();
