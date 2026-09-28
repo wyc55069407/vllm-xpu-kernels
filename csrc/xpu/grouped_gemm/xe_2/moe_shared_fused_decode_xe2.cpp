@@ -120,6 +120,49 @@ void launch_map_build(
             ids_slm[r] = (int32_t)ids[r];
           sycl::group_barrier(item.get_group());
 
+          if (R <= MAP_WG && num_tokens <= tile_m) {
+            // Decode fast path: every expert receives at most num_tokens <=
+            // tile_m rows, i.e. at most one tile, so the map follows from
+            // ranks among the R routes (no per-expert scan / serial prefix):
+            //   perm_pos[r] = #routes with a smaller id (+ earlier same id)
+            //   tile(e)     = #distinct ids smaller than e
+            int32_t* first = rows;  // first[r]: route r is its id's first
+            if (lane < R) {
+              const int e = ids_slm[lane];
+              int f = 1;
+              for (int s = 0; s < lane; ++s)
+                f &= ids_slm[s] != e;
+              first[lane] = f;
+            }
+            sycl::group_barrier(item.get_group());
+            if (lane < R) {
+              const int e = ids_slm[lane];
+              int less = 0, before = 0, cnt = 0, tile = 0;
+              for (int s = 0; s < R; ++s) {
+                const int es = ids_slm[s];
+                less += es < e;
+                cnt += es == e;
+                before += (es == e) & (s < lane);
+                tile += (es < e) & first[s];
+              }
+              const int p = less + before;
+              perm_pos[lane] = p;
+              w_perm[p] = weights[lane];
+              if (first[lane]) {
+                mt_expert[tile] = e;
+                mt_row_base[tile] = less;
+                mt_rows[tile] = cnt;
+              }
+            }
+            if (lane == 0) {
+              int n = 0;
+              for (int s = 0; s < R; ++s)
+                n += first[s];
+              total_mt[0] = n;
+            }
+            return;
+          }
+
           const int tm_shift = (tile_m == 8) ? 3 : 4;  // tile_m is 2^k; GPU
           // integer division is emulated (~100 cycles) and the serial prefix
           // does one per expert -- 256 divs cost ~12us, shifts cost nothing.
