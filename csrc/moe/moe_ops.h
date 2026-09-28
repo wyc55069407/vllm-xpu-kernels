@@ -118,3 +118,16 @@ void router_gemv_topk_softmax(
     torch::Tensor& topk_weights,
     torch::Tensor& topk_ids,
     bool renormalize);
+
+void router_resadd_norm_gemv_topk_softmax(
+    const torch::Tensor& x,
+    const torch::Tensor& residual,
+    const torch::Tensor& norm_weight,
+    double eps,
+    const torch::Tensor& router_weight,
+    torch::Tensor& logits,
+    torch::Tensor& topk_weights,
+    torch::Tensor& topk_ids,
+    torch::Tensor& normed_out,
+    torch::Tensor& residual_out,
+    bool renormalize);
