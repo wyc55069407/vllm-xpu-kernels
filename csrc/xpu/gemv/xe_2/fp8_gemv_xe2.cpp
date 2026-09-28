@@ -314,6 +314,25 @@ std::optional<torch::Tensor> try_fp8_gemv_w8a16(
   return fp8_gemv_w8a16(a, b_kn.t(), *scale);
 }
 
+std::tuple<torch::Tensor, torch::Tensor> fp8_gemm_w8a16_pair(
+    const torch::Tensor& a,
+    const torch::Tensor& b1_kn,
+    const torch::Tensor& scale1,
+    const torch::Tensor& b2_kn,
+    const torch::Tensor& scale2) {
+  if (fp8_gemv_w8a16_supported_nt(a, b1_kn, scale1, std::nullopt) &&
+      fp8_gemv_w8a16_supported_nt(a, b2_kn, scale2, std::nullopt))
+    return fp8_gemv2_w8a16(a, b1_kn.t(), scale1, b2_kn.t(), scale2);
+  using Sig = torch::Tensor(
+      const torch::Tensor&, const torch::Tensor&,
+      const std::optional<torch::Tensor>&, const std::optional<torch::Tensor>&);
+  static auto gemm = c10::Dispatcher::singleton()
+                         .findSchemaOrThrow("_xpu_C::fp8_gemm_w8a16", "")
+                         .typed<Sig>();
+  return {gemm.call(a, b1_kn, scale1, std::nullopt),
+          gemm.call(a, b2_kn, scale2, std::nullopt)};
+}
+
 // Drop-in for the fp8_gemm_w8a16(A, B=[K,N] NT view, B_scale, bias) entry:
 // takes the GEMV path when supported, otherwise calls the oneDNN op.
 torch::Tensor fp8_gemm_w8a16_dispatch(
