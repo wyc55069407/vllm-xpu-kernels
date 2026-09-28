@@ -47,4 +47,36 @@ std::tuple<torch::Tensor, torch::Tensor> fp8_gemm_w8a16_pair(
     const torch::Tensor& b2_kn,
     const torch::Tensor& scale2);
 
+// RMSNormGated (norm_before_gate, per head of D = norm_weight.numel()) of
+// x with gate z, then fp8_gemm_w8a16 with B = W^T. One launch for decode.
+torch::Tensor gated_rmsnorm_fp8_gemm(
+    const torch::Tensor& x,
+    const torch::Tensor& z,
+    const torch::Tensor& norm_weight,
+    double eps,
+    const torch::Tensor& b_kn,
+    const torch::Tensor& scale);
+
+// Gemma fused_add_rms_norm (t = x + residual, (1 + w) weight) then
+// fp8_gemm_w8a16; returns (out, residual_out = t). One launch for decode.
+std::tuple<torch::Tensor, torch::Tensor> resadd_rmsnorm_fp8_gemm(
+    const torch::Tensor& x,
+    const torch::Tensor& residual,
+    const torch::Tensor& norm_weight,
+    double eps,
+    const torch::Tensor& b_kn,
+    const torch::Tensor& scale);
+
+// Same with two weights; returns (out1, out2, residual_out).
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor>
+resadd_rmsnorm_fp8_gemm_pair(
+    const torch::Tensor& x,
+    const torch::Tensor& residual,
+    const torch::Tensor& norm_weight,
+    double eps,
+    const torch::Tensor& b1_kn,
+    const torch::Tensor& scale1,
+    const torch::Tensor& b2_kn,
+    const torch::Tensor& scale2);
+
 }  // namespace vllm::fp8_gemv
