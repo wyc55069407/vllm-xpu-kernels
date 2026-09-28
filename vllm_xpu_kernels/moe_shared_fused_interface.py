@@ -14,8 +14,10 @@ import torch
 
 # Largest num_tokens * top_k handled by the kernel's routing map.
 _MAX_ROUTED_ROWS = 512
-# Limits of torch.ops._moe_C.router_gemv_topk_softmax.
+# Limits of torch.ops._moe_C.router_gemv_topk_softmax (and of the fused
+# residual-add + RMSNorm variant, which also needs K <= 6144).
 _ROUTER_MAX_TOKENS = 8
+_ROUTER_NORM_MAX_HIDDEN = 6144
 _ROUTER_MAX_EXPERTS = 512
 _ROUTER_MAX_TOP_K = 16
 
@@ -36,6 +38,16 @@ def router_is_available() -> bool:
     except ImportError:
         return False
     return hasattr(torch.ops._moe_C, "router_gemv_topk_softmax")
+
+
+def router_norm_supports(hidden_size: int) -> bool:
+    """Whether the residual-add + RMSNorm router variant supports hidden_size
+    (in addition to router_supports())."""
+    return (
+        router_is_available()
+        and hasattr(torch.ops._moe_C, "router_resadd_norm_gemv_topk_softmax")
+        and hidden_size <= _ROUTER_NORM_MAX_HIDDEN
+    )
 
 
 def router_supports(
@@ -211,17 +223,9 @@ class XpuMoESharedFusedDecode:
         buffers are reused across calls with the same M.
         """
         assert self.router_weight is not None, "no router_weight given"
-        m = hidden_states.shape[0]
-        bufs = self._routing.get(m)
-        if bufs is None:
-            dev = hidden_states.device
-            bufs = (
-                torch.empty(m, self.num_experts, dtype=torch.float32, device=dev),
-                torch.empty(m, self.top_k, dtype=torch.float32, device=dev),
-                torch.empty(m, self.top_k, dtype=torch.int32, device=dev),
-            )
-            self._routing[m] = bufs
-        logits, topk_weights, topk_ids = bufs
+        logits, topk_weights, topk_ids = self._routing_buffers(
+            hidden_states.shape[0], hidden_states.device
+        )
         torch.ops._moe_C.router_gemv_topk_softmax(
             hidden_states,
             self.router_weight,
@@ -232,9 +236,55 @@ class XpuMoESharedFusedDecode:
         )
         return topk_weights, topk_ids
 
+    def _routing_buffers(
+        self, m: int, device: torch.device
+    ) -> tuple[torch.Tensor, ...]:
+        bufs = self._routing.get(m)
+        if bufs is None:
+            bufs = (
+                torch.empty(m, self.num_experts, dtype=torch.float32, device=device),
+                torch.empty(m, self.top_k, dtype=torch.float32, device=device),
+                torch.empty(m, self.top_k, dtype=torch.int32, device=device),
+            )
+            self._routing[m] = bufs
+        return bufs
+
     def forward_routed(
         self, output: torch.Tensor, hidden_states: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """route() + forward(); returns (output, topk_ids)."""
         topk_weights, topk_ids = self.route(hidden_states)
         return self.forward(output, hidden_states, topk_weights, topk_ids), topk_ids
+
+    def forward_resadd_norm_routed(
+        self,
+        output: torch.Tensor,
+        x: torch.Tensor,
+        residual: torch.Tensor,
+        norm_weight: torch.Tensor,
+        eps: float,
+        normed_out: torch.Tensor,
+        residual_out: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """MoE block including its input residual-add + Gemma RMSNorm.
+
+        residual_out = x + residual; normed_out = rms_norm(residual_out) *
+        (1 + norm_weight); then routing and experts on normed_out. The norm
+        and the routing run in one kernel. Returns (output, topk_ids).
+        """
+        assert self.router_weight is not None, "no router_weight given"
+        logits, topk_weights, topk_ids = self._routing_buffers(x.shape[0], x.device)
+        torch.ops._moe_C.router_resadd_norm_gemv_topk_softmax(
+            x,
+            residual,
+            norm_weight,
+            eps,
+            self.router_weight,
+            logits,
+            topk_weights,
+            topk_ids,
+            normed_out,
+            residual_out,
+            self.renormalize,
+        )
+        return self.forward(output, normed_out, topk_weights, topk_ids), topk_ids
