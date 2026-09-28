@@ -342,6 +342,16 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, xpu_ops) {
       "fused_input_norm(Tensor! out, Tensor input, Tensor weight, "
       "Tensor bias) -> ()");
   xpu_ops.impl("fused_input_norm", torch::kXPU, &fused_input_norm);
+
+  // Split of a (gated) QKV projection + per-head q/k RMSNorm + NeoX (M)RoPE
+  // [+ copy of the raw output gate]; v stays a view of qkv.
+  xpu_ops.def(
+      "qkv_split_norm_rope(Tensor qkv, Tensor positions, Tensor q_weight, "
+      "Tensor k_weight, Tensor cos_sin_cache, Tensor! q_out, Tensor! k_out, "
+      "Tensor!? gate_out, int num_q_heads, int num_kv_heads, int head_dim, "
+      "int rotary_dim, float eps, float weight_offset, int[] mrope_section, "
+      "bool mrope_interleaved) -> ()");
+  xpu_ops.impl("qkv_split_norm_rope", torch::kXPU, &qkv_split_norm_rope);
 }
 
 REGISTER_EXTENSION(TORCH_EXTENSION_NAME)
