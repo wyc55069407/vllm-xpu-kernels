@@ -42,6 +42,23 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, xpu_ops) {
       "fp8_gemm_w8a16(Tensor A, Tensor B, Tensor? B_scale_, "
       "Tensor? bias_) -> Tensor");
   xpu_ops.impl("fp8_gemm_w8a16", torch::kXPU, &fp8_gemm_w8a16);
+
+  // One-shot P2P custom all-reduce for tensor parallel = 2 (Level Zero IPC).
+  xpu_ops.def("custom_ar_create(int max_bytes) -> int");
+  xpu_ops.impl("custom_ar_create", &custom_ar_create);
+  xpu_ops.def("custom_ar_export(int handle) -> int[]");
+  xpu_ops.impl("custom_ar_export", &custom_ar_export);
+  xpu_ops.def(
+      "custom_ar_open(int handle, int rank, int[] peer, int mode_mask) -> int");
+  xpu_ops.impl("custom_ar_open", &custom_ar_open);
+  xpu_ops.def("custom_ar_all_reduce_(Tensor(a!) x, int handle) -> ()");
+  xpu_ops.impl("custom_ar_all_reduce_", torch::kXPU, &custom_ar_all_reduce_);
+  xpu_ops.def("custom_ar_error(int handle) -> int");
+  xpu_ops.impl("custom_ar_error", &custom_ar_error);
+  xpu_ops.def("custom_ar_destroy(int handle) -> ()");
+  xpu_ops.impl("custom_ar_destroy", &custom_ar_destroy);
+  xpu_ops.def("custom_ar_max_bytes_limit() -> int");
+  xpu_ops.impl("custom_ar_max_bytes_limit", &custom_ar_max_bytes_limit);
 #ifdef VLLM_XPU_ENABLE_XE2
   // Two fp8_gemm_w8a16 sharing A (e.g. GDN in_proj_qkvz + in_proj_ba): one
   // GEMV launch for single-row A, two oneDNN calls otherwise.
