@@ -29,6 +29,9 @@
 //     and one barrier per work-group; work-group 0 writes residual_out.
 // Other shapes (M <= 8, other K / D) use a generic, slower path that reloads
 // the activations per chunk (correct, not tuned; supported() is M == 1 only).
+//
+// The graph-level *_fp8_gemm entries take the fused GEMV for M == 1 only;
+// other inputs run one standalone SYCL RMSNorm kernel + fp8_gemm_w8a16.
 #include <sycl/sycl.hpp>
 #include <sycl/ext/oneapi/experimental/enqueue_functions.hpp>
 
@@ -830,9 +833,157 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> resadd_rmsnorm_fp8_gemv2
 
 
 // ---------------------------------------------------------------------------
+// Standalone RMSNorm kernels for the unfused path (M > 1): one launch per
+// norm instead of an eager ATen op chain, whose per-op host cost dominated
+// multi-row decode. Same math as the fused prologues (fp32, one work-group
+// per row / per (row, head)); fp16 in and out.
+// ---------------------------------------------------------------------------
+constexpr int kNormWg = 256;
+
+struct GatedNormKernel {
+  const sycl::half* x;
+  const sycl::half* z;
+  const sycl::half* wn;
+  sycl::half* y;  // [M, H * D] contiguous
+  int64_t xs_m, xs_h, zs_m, zs_h;
+  int H, D;
+  float eps;
+
+  void operator()(sycl::nd_item<1> it) const {
+    const int g = it.get_group(0), lid = it.get_local_id(0);
+    const int m = g / H, h = g - m * H;
+    const sycl::half* xh = x + m * xs_m + h * xs_h;
+    const sycl::half* zh = z + m * zs_m + h * zs_h;
+    sycl::half* yh = y + int64_t(g) * D;
+    float ss = 0.f;
+    for (int d = lid; d < D; d += kNormWg) {
+      const float v = float(xh[d]);
+      ss = sycl::fma(v, v, ss);
+    }
+    ss = sycl::reduce_over_group(it.get_group(), ss, sycl::plus<float>());
+    const float rstd = sycl::rsqrt(ss / float(D) + eps);
+    for (int d = lid; d < D; d += kNormWg)
+      yh[d] = sycl::half(float(xh[d]) * rstd * float(wn[d]) *
+                         silu(float(zh[d])));
+  }
+};
+
+struct ResAddNormKernel {
+  const sycl::half* x;
+  const sycl::half* r;
+  const sycl::half* wn;
+  sycl::half* y;      // [M, K] contiguous
+  sycl::half* r_out;  // [M, K] contiguous
+  int64_t xs, rs;
+  int K;
+  float eps;
+
+  void operator()(sycl::nd_item<1> it) const {
+    const int m = it.get_group(0), lid = it.get_local_id(0);
+    const sycl::half* xm = x + m * xs;
+    const sycl::half* rm = r + m * rs;
+    float ss = 0.f;
+    for (int k = lid; k < K; k += kNormWg) {
+      const float t = float(xm[k]) + float(rm[k]);
+      r_out[int64_t(m) * K + k] = sycl::half(t);
+      ss = sycl::fma(t, t, ss);
+    }
+    ss = sycl::reduce_over_group(it.get_group(), ss, sycl::plus<float>());
+    const float rstd = sycl::rsqrt(ss / float(K) + eps);
+    for (int k = lid; k < K; k += kNormWg) {
+      const float t = float(xm[k]) + float(rm[k]);
+      y[int64_t(m) * K + k] = sycl::half(t * rstd * (float(wn[k]) + 1.f));
+    }
+  }
+};
+
+// fp16 [M, H, D] or [M, H*D] with contiguous last dim; returns (s_m, s_h).
+static bool norm_heads_ok(const torch::Tensor& t, const torch::Tensor& ref,
+                          int64_t H, int64_t D, int64_t& s_m, int64_t& s_h) {
+  if (!t.is_xpu() || t.scalar_type() != at::kHalf || t.device() != ref.device())
+    return false;
+  if (t.dim() == 3 && t.size(1) == H && t.size(2) == D && t.stride(2) == 1) {
+    s_m = t.stride(0);
+    s_h = t.stride(1);
+    return true;
+  }
+  if (t.dim() == 2 && t.size(1) == H * D && t.stride(1) == 1) {
+    s_m = t.stride(0);
+    s_h = D;
+    return true;
+  }
+  return false;
+}
+
+// Returns y [M, H*D], or nullopt if the inputs need the generic ATen path.
+static std::optional<torch::Tensor> gated_rmsnorm_kernel(
+    const torch::Tensor& x,
+    const torch::Tensor& z,
+    const torch::Tensor& wn,
+    double eps) {
+  if (wn.dim() != 1 || wn.scalar_type() != at::kHalf || wn.stride(0) != 1 ||
+      wn.device() != x.device() || (x.dim() != 2 && x.dim() != 3) ||
+      z.sizes() != x.sizes())
+    return std::nullopt;
+  const int64_t D = wn.size(0), M = x.size(0);
+  if (D < 1 || (x.dim() == 2 && x.size(1) % D != 0)) return std::nullopt;
+  const int64_t H = x.dim() == 3 ? x.size(1) : x.size(1) / D;
+  int64_t xs_m, xs_h, zs_m, zs_h;
+  if (H < 1 || !norm_heads_ok(x, x, H, D, xs_m, xs_h) ||
+      !norm_heads_ok(z, x, H, D, zs_m, zs_h) || M * H >= (int64_t(1) << 31))
+    return std::nullopt;
+  const at::DeviceGuard guard(x.device());
+  auto y = at::empty({M, H * D}, x.options());
+  if (M == 0) return y;
+  syclex::nd_launch(
+      vllm::xpu::vllmGetQueue(),
+      sycl::nd_range<1>(size_t(M * H) * kNormWg, kNormWg),
+      GatedNormKernel{
+          reinterpret_cast<const sycl::half*>(x.data_ptr()),
+          reinterpret_cast<const sycl::half*>(z.data_ptr()),
+          reinterpret_cast<const sycl::half*>(wn.data_ptr()),
+          reinterpret_cast<sycl::half*>(y.data_ptr()), xs_m, xs_h, zs_m, zs_h,
+          int(H), int(D), float(eps)});
+  return y;
+}
+
+// Returns (y, residual_out) [M, K], or nullopt for the generic ATen path.
+static std::optional<std::tuple<torch::Tensor, torch::Tensor>>
+resadd_rmsnorm_kernel(
+    const torch::Tensor& x,
+    const torch::Tensor& r,
+    const torch::Tensor& wn,
+    double eps) {
+  if (!x.is_xpu() || x.dim() != 2 || r.sizes() != x.sizes() ||
+      x.scalar_type() != at::kHalf || r.scalar_type() != at::kHalf ||
+      wn.scalar_type() != at::kHalf || wn.dim() != 1 ||
+      wn.size(0) != x.size(1) || x.stride(1) != 1 || r.stride(1) != 1 ||
+      wn.stride(0) != 1 || r.device() != x.device() ||
+      wn.device() != x.device() || x.size(0) >= (int64_t(1) << 31))
+    return std::nullopt;
+  const int64_t M = x.size(0), K = x.size(1);
+  const at::DeviceGuard guard(x.device());
+  auto y = at::empty({M, K}, x.options());
+  auto r_out = at::empty({M, K}, x.options());
+  if (M > 0 && K > 0)
+    syclex::nd_launch(
+        vllm::xpu::vllmGetQueue(),
+        sycl::nd_range<1>(size_t(M) * kNormWg, kNormWg),
+        ResAddNormKernel{
+            reinterpret_cast<const sycl::half*>(x.data_ptr()),
+            reinterpret_cast<const sycl::half*>(r.data_ptr()),
+            reinterpret_cast<const sycl::half*>(wn.data_ptr()),
+            reinterpret_cast<sycl::half*>(y.data_ptr()),
+            reinterpret_cast<sycl::half*>(r_out.data_ptr()), x.stride(0),
+            r.stride(0), int(K), float(eps)});
+  return std::make_tuple(y, r_out);
+}
+
+// ---------------------------------------------------------------------------
 // Graph-level entries: fused kernel when supported (decode M == 1), otherwise
-// the unfused norm (ATen) followed by fp8_gemm_w8a16. B*_kn are the [K, N]
-// transposed views that fp8_gemm_w8a16 takes.
+// the unfused norm (one SYCL kernel above, ATen for other dtypes / layouts)
+// followed by fp8_gemm_w8a16. B*_kn are the [K, N] transposed views that
+// fp8_gemm_w8a16 takes.
 // ---------------------------------------------------------------------------
 static torch::Tensor call_fp8_gemm_w8a16(
     const torch::Tensor& a, const torch::Tensor& b_kn, const torch::Tensor& s) {
@@ -855,6 +1006,8 @@ torch::Tensor gated_rmsnorm_fp8_gemm(
   if (b_kn.dim() == 2 &&
       gated_rmsnorm_fp8_gemv_supported(x, z, norm_weight, b_kn.t(), scale))
     return gated_rmsnorm_fp8_gemv(x, z, norm_weight, eps, b_kn.t(), scale);
+  if (auto y = gated_rmsnorm_kernel(x, z, norm_weight, eps))
+    return call_fp8_gemm_w8a16(*y, b_kn, scale);
   // RMSNormGated (norm_before_gate): per head of D = norm_weight.numel().
   const int64_t D = norm_weight.numel();
   auto xf = x.reshape({-1, D}).to(at::kFloat);
@@ -866,11 +1019,13 @@ torch::Tensor gated_rmsnorm_fp8_gemm(
       y.to(x.scalar_type()).reshape({rows, -1}), b_kn, scale);
 }
 
-static std::tuple<torch::Tensor, torch::Tensor> resadd_rmsnorm_aten(
+static std::tuple<torch::Tensor, torch::Tensor> resadd_rmsnorm_unfused(
     const torch::Tensor& x,
     const torch::Tensor& residual,
     const torch::Tensor& norm_weight,
     double eps) {
+  if (auto yr = resadd_rmsnorm_kernel(x, residual, norm_weight, eps))
+    return *yr;
   auto t = x.to(at::kFloat) + residual.to(at::kFloat);
   auto y = t * at::rsqrt(t.pow(2).mean(-1, true) + eps) *
            (norm_weight.to(at::kFloat) + 1.0);
@@ -887,7 +1042,7 @@ std::tuple<torch::Tensor, torch::Tensor> resadd_rmsnorm_fp8_gemm(
   if (b_kn.dim() == 2 &&
       resadd_rmsnorm_fp8_gemv_supported(x, residual, norm_weight, b_kn.t(), scale))
     return resadd_rmsnorm_fp8_gemv(x, residual, norm_weight, eps, b_kn.t(), scale);
-  auto [y, r_out] = resadd_rmsnorm_aten(x, residual, norm_weight, eps);
+  auto [y, r_out] = resadd_rmsnorm_unfused(x, residual, norm_weight, eps);
   return {call_fp8_gemm_w8a16(y, b_kn, scale), r_out};
 }
 
@@ -908,7 +1063,7 @@ resadd_rmsnorm_fp8_gemm_pair(
           x, residual, norm_weight, b2_kn.t(), scale2))
     return resadd_rmsnorm_fp8_gemv2(
         x, residual, norm_weight, eps, b1_kn.t(), scale1, b2_kn.t(), scale2);
-  auto [y, r_out] = resadd_rmsnorm_aten(x, residual, norm_weight, eps);
+  auto [y, r_out] = resadd_rmsnorm_unfused(x, residual, norm_weight, eps);
   return {
       call_fp8_gemm_w8a16(y, b1_kn, scale1),
       call_fp8_gemm_w8a16(y, b2_kn, scale2),
